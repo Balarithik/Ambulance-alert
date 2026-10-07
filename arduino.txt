@@ -1,0 +1,776 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <WebServer.h>
+
+// =====================================================
+// WIFI
+// =====================================================
+
+const char* WIFI_SSID = "POCO";
+const char* WIFI_PASSWORD = "11111111";
+
+// =====================================================
+// NETWORK
+// =====================================================
+
+// Vehicle ESP32
+IPAddress vehicleIP(10, 194, 207, 47);
+
+const unsigned int UDP_PORT = 4210;
+
+// =====================================================
+// PINS
+// =====================================================
+
+#define LM35_PIN 34
+#define HEART_PIN 35
+
+// GPIO 4:
+// Patient sensor capture button
+#define SENSOR_BUTTON 4
+
+// GPIO 5:
+// Emergency / ambulance vehicle alert button
+#define EMERGENCY_BUTTON 5
+
+#define LED_PIN 2
+
+// =====================================================
+// HTTP SERVER
+// =====================================================
+
+WebServer server(80);
+
+// =====================================================
+// UDP
+// =====================================================
+
+WiFiUDP udp;
+
+// =====================================================
+// BUTTON STATES
+// =====================================================
+
+bool lastSensorButtonState = HIGH;
+bool lastEmergencyButtonState = HIGH;
+
+// =====================================================
+// SENSOR VALUES
+// =====================================================
+
+float currentTemperature = 0.0;
+int currentHeartRate = 0;
+
+// =====================================================
+// HEART RATE DETECTION
+// =====================================================
+
+int signalValue = 0;
+
+// Change this value according to your actual sensor
+int threshold = 2000;
+
+bool beatDetected = false;
+
+unsigned long lastBeatTime = 0;
+unsigned long lastSensorReadingTime = 0;
+
+int beatInterval = 0;
+
+int heartRate = 0;
+
+// =====================================================
+// PATIENT READING INFORMATION
+// =====================================================
+
+// Increment whenever the physical sensor button is pressed
+unsigned long readingId = 0;
+
+// Time at which the latest reading was captured
+unsigned long lastReadingTime = 0;
+
+// Indicates that a new reading was generated
+bool newReadingAvailable = false;
+
+// =====================================================
+// READ LM35
+// =====================================================
+
+float readLM35()
+{
+  int adcValue = analogRead(LM35_PIN);
+
+  float voltage = (adcValue / 4095.0) * 3.3;
+
+  // LM35 = 10 mV / °C
+  float temperature = voltage * 100.0;
+
+  return temperature;
+}
+
+// =====================================================
+// UPDATE HEART RATE
+// =====================================================
+
+void updateHeartRate()
+{
+  signalValue = analogRead(HEART_PIN);
+
+  unsigned long now = millis();
+
+  // Detect rising edge
+  if (signalValue > threshold && !beatDetected)
+  {
+    beatDetected = true;
+
+    if (lastBeatTime > 0)
+    {
+      beatInterval = now - lastBeatTime;
+
+      // Accept approximately 30-200 BPM
+      if (beatInterval > 300 && beatInterval < 2000)
+      {
+        heartRate = 60000 / beatInterval;
+      }
+    }
+
+    lastBeatTime = now;
+  }
+
+  // Reset detector when signal falls
+  if (signalValue < threshold)
+  {
+    beatDetected = false;
+  }
+
+  // No beat for 5 seconds
+  if (lastBeatTime > 0 && now - lastBeatTime > 5000)
+  {
+    heartRate = 0;
+  }
+
+  currentHeartRate = heartRate;
+}
+
+// =====================================================
+// CAPTURE PATIENT SENSOR READING
+// =====================================================
+
+void capturePatientReading()
+{
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("       PATIENT SENSOR CAPTURE");
+  Serial.println("========================================");
+
+  Serial.println("Capturing sensor data...");
+
+  // ---------------------------------------------------
+  // Capture temperature
+  // ---------------------------------------------------
+
+  currentTemperature = readLM35();
+
+  // ---------------------------------------------------
+  // Give heart-rate sensor time to update
+  // ---------------------------------------------------
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 1000)
+  {
+    updateHeartRate();
+    delay(5);
+  }
+
+  // ---------------------------------------------------
+  // Generate reading ID
+  // ---------------------------------------------------
+
+  readingId++;
+
+  lastReadingTime = millis();
+
+  newReadingAvailable = true;
+
+  // ---------------------------------------------------
+  // Print result
+  // ---------------------------------------------------
+
+  Serial.println();
+  Serial.println("----------------------------------------");
+
+  Serial.print("Reading ID: ");
+  Serial.println(readingId);
+
+  Serial.print("Temperature: ");
+  Serial.print(currentTemperature, 2);
+  Serial.println(" °C");
+
+  if (currentHeartRate > 0)
+  {
+    Serial.print("Heart Rate: ");
+    Serial.print(currentHeartRate);
+    Serial.println(" BPM");
+  }
+  else
+  {
+    Serial.println("Heart Rate: NO VALID READING");
+  }
+
+  Serial.println("----------------------------------------");
+
+  Serial.println("New sensor reading available to Django.");
+
+  Serial.println("========================================");
+
+  // ---------------------------------------------------
+  // LED indication
+  // ---------------------------------------------------
+
+  digitalWrite(LED_PIN, HIGH);
+  delay(300);
+  digitalWrite(LED_PIN, LOW);
+}
+
+// =====================================================
+// SEND EMERGENCY / VEHICLE ALERT
+// =====================================================
+
+void sendEmergencyAlert()
+{
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("       EMERGENCY BUTTON PRESSED");
+  Serial.println("========================================");
+
+  Serial.print("Vehicle IP: ");
+  Serial.println(vehicleIP);
+
+  udp.beginPacket(vehicleIP, UDP_PORT);
+
+  udp.print("AMBULANCE_ALERT");
+
+  int result = udp.endPacket();
+
+  if (result == 1)
+  {
+    Serial.println("AMBULANCE ALERT SENT");
+  }
+  else
+  {
+    Serial.println("AMBULANCE ALERT FAILED");
+  }
+
+  Serial.println("========================================");
+
+  // Emergency LED indication
+
+  for (int i = 0; i < 5; i++)
+  {
+    digitalWrite(LED_PIN, HIGH);
+    delay(200);
+
+    digitalWrite(LED_PIN, LOW);
+    delay(200);
+  }
+}
+
+// =====================================================
+// ROOT API
+// =====================================================
+
+void handleRoot()
+{
+  String response = "";
+
+  response += "LifeSyncAI Ambulance ESP32 API\n\n";
+
+  response += "Device IP: ";
+  response += WiFi.localIP().toString();
+  response += "\n\n";
+
+  response += "Endpoints:\n";
+
+  response += "GET /api/data\n";
+  response += "GET /api/status\n";
+  response += "GET /api/health\n";
+
+  response += "\nPhysical buttons:\n";
+
+  response += "GPIO 4 = Capture Patient Sensor Data\n";
+  response += "GPIO 5 = Emergency / Vehicle Alert\n";
+
+  server.send(
+    200,
+    "text/plain",
+    response
+  );
+}
+
+// =====================================================
+// /api/data
+// =====================================================
+
+void handleData()
+{
+  // Always read current temperature
+  // The stored captured value remains available as well
+
+  String json = "{";
+
+  // ---------------------------------------------------
+  // Device information
+  // ---------------------------------------------------
+
+  json += "\"device\":\"LifeSyncAI-Ambulance-ESP32\",";
+
+  json += "\"ambulance_ip\":\"";
+  json += WiFi.localIP().toString();
+  json += "\",";
+
+  // ---------------------------------------------------
+  // Reading information
+  // ---------------------------------------------------
+
+  json += "\"reading_id\":";
+  json += String(readingId);
+  json += ",";
+
+  json += "\"new_reading\":";
+  json += newReadingAvailable ? "true" : "false";
+  json += ",";
+
+  // ---------------------------------------------------
+  // Sensor values
+  // ---------------------------------------------------
+
+  if (currentHeartRate > 0)
+  {
+    json += "\"heart_rate\":";
+    json += String(currentHeartRate);
+  }
+  else
+  {
+    json += "\"heart_rate\":null";
+  }
+
+  json += ",";
+
+  json += "\"heart_rate_unit\":\"BPM\",";
+
+  json += "\"temperature\":";
+  json += String(currentTemperature, 2);
+
+  json += ",";
+
+  json += "\"temperature_unit\":\"C\",";
+
+  // ---------------------------------------------------
+  // Timestamp
+  // ---------------------------------------------------
+
+  json += "\"timestamp_ms\":";
+  json += String(lastReadingTime);
+
+  json += ",";
+
+  // ---------------------------------------------------
+  // Sensor status
+  // ---------------------------------------------------
+
+  json += "\"heart_rate_sensor\":\"";
+
+  if (currentHeartRate > 0)
+  {
+    json += "connected";
+  }
+  else
+  {
+    json += "no_valid_reading";
+  }
+
+  json += "\",";
+
+  json += "\"temperature_sensor\":\"connected\"";
+
+  json += "}";
+
+  // ---------------------------------------------------
+  // CORS
+  // ---------------------------------------------------
+
+  server.sendHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-cache"
+  );
+
+  // ---------------------------------------------------
+  // Send JSON
+  // ---------------------------------------------------
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+
+  // Once Django/frontend has fetched it,
+  // mark it as no longer new.
+
+  newReadingAvailable = false;
+}
+
+// =====================================================
+// /api/status
+// =====================================================
+
+void handleStatus()
+{
+  String json = "{";
+
+  json += "\"device\":\"LifeSyncAI Ambulance ESP32\",";
+
+  json += "\"wifi\":\"";
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    json += "connected";
+  }
+  else
+  {
+    json += "disconnected";
+  }
+
+  json += "\",";
+
+  json += "\"ip\":\"";
+  json += WiFi.localIP().toString();
+  json += "\",";
+
+  json += "\"uptime_ms\":";
+  json += String(millis());
+
+  json += ",";
+
+  json += "\"last_reading_id\":";
+  json += String(readingId);
+
+  json += ",";
+
+  json += "\"heart_rate\":";
+  json += String(currentHeartRate);
+
+  json += ",";
+
+  json += "\"temperature\":";
+  json += String(currentTemperature, 2);
+
+  json += "}";
+
+  server.sendHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+// =====================================================
+// /api/health
+// =====================================================
+
+void handleHealth()
+{
+  server.sendHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  server.send(
+    200,
+    "application/json",
+    "{\"status\":\"ok\",\"device\":\"LifeSyncAI ESP32\"}"
+  );
+}
+
+// =====================================================
+// 404
+// =====================================================
+
+void handleNotFound()
+{
+  server.sendHeader(
+    "Access-Control-Allow-Origin",
+    "*"
+  );
+
+  server.send(
+    404,
+    "application/json",
+    "{\"error\":\"Endpoint not found\"}"
+  );
+}
+
+// =====================================================
+// WIFI
+// =====================================================
+
+void connectWiFi()
+{
+  Serial.println();
+  Serial.println("Connecting to WiFi...");
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println();
+
+  Serial.println("========================================");
+  Serial.println("       WIFI CONNECTED");
+  Serial.println("========================================");
+
+  Serial.print("ESP32 IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.println();
+
+  Serial.println("API ENDPOINTS:");
+
+  Serial.print("Health: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/api/health");
+
+  Serial.print("Status: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/api/status");
+
+  Serial.print("Data:   http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/api/data");
+
+  Serial.println();
+
+  Serial.print("Vehicle IP: ");
+  Serial.println(vehicleIP);
+
+  Serial.println("========================================");
+
+  // Start UDP
+
+  udp.begin(UDP_PORT);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("        LIFESYNCAI AMBULANCE");
+  Serial.println("              ESP32");
+  Serial.println("========================================");
+
+  // ---------------------------------------------------
+  // Buttons
+  // ---------------------------------------------------
+
+  pinMode(
+    SENSOR_BUTTON,
+    INPUT_PULLUP
+  );
+
+  pinMode(
+    EMERGENCY_BUTTON,
+    INPUT_PULLUP
+  );
+
+  // ---------------------------------------------------
+  // LED
+  // ---------------------------------------------------
+
+  pinMode(
+    LED_PIN,
+    OUTPUT
+  );
+
+  digitalWrite(
+    LED_PIN,
+    LOW
+  );
+
+  // ---------------------------------------------------
+  // Sensors
+  // ---------------------------------------------------
+
+  pinMode(
+    LM35_PIN,
+    INPUT
+  );
+
+  pinMode(
+    HEART_PIN,
+    INPUT
+  );
+
+  // ---------------------------------------------------
+  // Initial sensor read
+  // ---------------------------------------------------
+
+  currentTemperature = readLM35();
+
+  // ---------------------------------------------------
+  // WiFi
+  // ---------------------------------------------------
+
+  connectWiFi();
+
+  // ---------------------------------------------------
+  // HTTP routes
+  // ---------------------------------------------------
+
+  server.on(
+    "/",
+    HTTP_GET,
+    handleRoot
+  );
+
+  server.on(
+    "/api/data",
+    HTTP_GET,
+    handleData
+  );
+
+  server.on(
+    "/api/status",
+    HTTP_GET,
+    handleStatus
+  );
+
+  server.on(
+    "/api/health",
+    HTTP_GET,
+    handleHealth
+  );
+
+  server.onNotFound(
+    handleNotFound
+  );
+
+  // ---------------------------------------------------
+  // Start HTTP server
+  // ---------------------------------------------------
+
+  server.begin();
+
+  Serial.println();
+  Serial.println("HTTP API SERVER STARTED");
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("             SYSTEM READY");
+  Serial.println("========================================");
+
+  Serial.println("GPIO 4  = SENSOR CAPTURE");
+  Serial.println("GPIO 5  = EMERGENCY ALERT");
+  Serial.println("GPIO 34 = LM35");
+  Serial.println("GPIO 35 = HEART RATE");
+
+  Serial.println("========================================");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // Handle HTTP requests
+  // ---------------------------------------------------
+
+  server.handleClient();
+
+  // ---------------------------------------------------
+  // Continuously monitor heart rate
+  // ---------------------------------------------------
+
+  updateHeartRate();
+
+  // ---------------------------------------------------
+  // SENSOR CAPTURE BUTTON
+  // GPIO 4
+  // ---------------------------------------------------
+
+  bool sensorButtonState =
+    digitalRead(SENSOR_BUTTON);
+
+  if (
+    sensorButtonState == LOW &&
+    lastSensorButtonState == HIGH
+  )
+  {
+    capturePatientReading();
+
+    // Debounce
+    delay(300);
+  }
+
+  lastSensorButtonState =
+    sensorButtonState;
+
+  // ---------------------------------------------------
+  // EMERGENCY BUTTON
+  // GPIO 5
+  // ---------------------------------------------------
+
+  bool emergencyButtonState =
+    digitalRead(EMERGENCY_BUTTON);
+
+  if (
+    emergencyButtonState == LOW &&
+    lastEmergencyButtonState == HIGH
+  )
+  {
+    sendEmergencyAlert();
+
+    // Debounce
+    delay(300);
+  }
+
+  lastEmergencyButtonState =
+    emergencyButtonState;
+
+  // ---------------------------------------------------
+  // Small loop delay
+  // ---------------------------------------------------
+
+  delay(5);
+}
