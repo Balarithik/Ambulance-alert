@@ -11,7 +11,7 @@ from sklearn.metrics import (
     accuracy_score, average_precision_score, confusion_matrix, f1_score,
     precision_score, recall_score, roc_auc_score,
 )
-from sklearn.model_selection import RandomizedSearchCV, StratifiedKFold
+from sklearn.model_selection import RandomizedSearchCV, StratifiedGroupKFold
 from xgboost import XGBClassifier
 
 
@@ -65,21 +65,27 @@ def compute_metrics(y_true, y_pred, y_proba) -> dict:
 
 def train_model_with_search(
     model, param_dist: dict, X_train, y_train, X_val, y_val,
-    n_iter: int = 8, cv: int = 3, scoring: str = "f1",
+    n_iter: int = 8, cv: int = 3, scoring: str = "f1", groups=None,
 ) -> tuple[object, dict, dict]:
-    """Tune on training folds; validation is only used for model comparison."""
+    """Tune using patient-grouped folds; validation is used only for model comparison."""
     if len(np.unique(y_train)) < 2:
         raise ValueError("Training split must contain both target classes.")
-    minority_count = int(np.bincount(np.asarray(y_train, dtype=int)).min())
-    folds = min(cv, minority_count)
+    if groups is None:
+        raise ValueError("Patient group IDs are required to prevent rows from one patient leaking across CV folds.")
+    groups = np.asarray(groups)
+    if len(groups) != len(y_train):
+        raise ValueError("groups length must match the number of training rows.")
+    unique_groups = np.unique(groups)
+    folds = min(cv, len(unique_groups))
     if folds < 2:
-        raise ValueError("Not enough minority-class examples for stratified cross-validation.")
+        raise ValueError("At least two distinct patients are required for grouped cross-validation.")
+    cv_splitter = StratifiedGroupKFold(n_splits=folds, shuffle=True, random_state=42)
     search = RandomizedSearchCV(
         estimator=model, param_distributions=param_dist, n_iter=n_iter,
-        cv=StratifiedKFold(n_splits=folds, shuffle=True, random_state=42),
+        cv=cv_splitter,
         scoring=scoring, n_jobs=-1, random_state=42, refit=True, error_score="raise",
     )
-    search.fit(X_train, y_train)
+    search.fit(X_train, y_train, groups=groups)
     best = search.best_estimator_
     proba = best.predict_proba(X_val)[:, 1]
     # Use a fixed threshold for comparable baseline metrics; tune threshold on validation later.
@@ -87,7 +93,7 @@ def train_model_with_search(
     return best, metrics, dict(search.best_params_)
 
 
-def train_all_models(X_train, y_train, X_val, y_val, class_weight: str = "balanced") -> dict:
+def train_all_models(X_train, y_train, X_val, y_val, groups_train, class_weight: str = "balanced") -> dict:
     results = {}
     models = get_models(class_weight)
     distributions = get_param_distributions()
@@ -96,7 +102,7 @@ def train_all_models(X_train, y_train, X_val, y_val, class_weight: str = "balanc
         try:
             best, metrics, params = train_model_with_search(
                 model, distributions[name], X_train, y_train, X_val, y_val,
-                n_iter=6, cv=3, scoring="average_precision",
+                n_iter=6, cv=3, scoring="average_precision", groups=groups_train,
             )
             results[name] = {"model": best, "metrics": metrics, "best_params": params}
             print(f"  Recall={metrics['recall']:.4f} F1={metrics['f1']:.4f} PR-AUC={metrics['pr_auc']}")
