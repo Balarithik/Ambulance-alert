@@ -89,6 +89,7 @@ class MLFeatureContractTestCase(TestCase):
 
 
     def test_new_patient_can_be_assessed_before_database_registration_when_demographics_are_sent(self):
+        self.client = APIClient()
         response = self.client.post(
             "/api/ml/predict/",
             {
