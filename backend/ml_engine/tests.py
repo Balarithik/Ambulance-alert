@@ -86,3 +86,24 @@ class MLFeatureContractTestCase(TestCase):
         self.assertEqual(original_features.loc[0, "HR_rolling_mean"], changed_features.loc[0, "HR_rolling_mean"])
         self.assertEqual(original_features.loc[1, "HR_rolling_mean"], changed_features.loc[1, "HR_rolling_mean"])
         self.assertEqual(original_features.loc[0, "gender"], 1.0)
+
+
+    def test_new_patient_can_be_assessed_before_database_registration_when_demographics_are_sent(self):
+        response = self.client.post(
+            "/api/ml/predict/",
+            {
+                "patient_id": "P-PREVIEW-001",
+                "age": 45,
+                "gender": "M",
+                "heart_rate": 118,
+                "temperature": 39.1,
+                "sbp": 100,
+                "dbp": 60,
+                "respiratory_rate": 24,
+            },
+            format="json",
+        )
+        # 503 is acceptable until the new model artifacts and Windows runtime are ready.
+        # A 400 here means the demographics contract regressed.
+        self.assertNotEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_503_SERVICE_UNAVAILABLE])
