@@ -26,7 +26,7 @@ from feature_engineering import (
 )
 from preprocessing import (
     split_patients_by_id, fit_preprocessor, apply_preprocessor,
-    save_preprocessor, save_feature_columns,
+    save_preprocessor, save_feature_columns, prepare_data_for_training,
 )
 from train import train_all_models, select_best_model, save_model, compute_metrics
 
@@ -119,6 +119,11 @@ def main():
     X_train, y_train = apply_preprocessor(train_dfs, feature_columns, preprocessor)
     X_val, y_val = apply_preprocessor(val_dfs, feature_columns, preprocessor)
     X_test, y_test = apply_preprocessor(test_dfs, feature_columns, preprocessor)
+    # Align group IDs to the same valid-label rows used by apply_preprocessor.
+    groups_train = []
+    for patient_frame in train_dfs:
+        _, patient_y = prepare_data_for_training(patient_frame, feature_columns)
+        groups_train.extend([str(patient_frame['patient_id'].iloc[0])] * len(patient_y))
 
     if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
         raise ValueError(
@@ -128,7 +133,7 @@ def main():
 
     print(f"Rows train/val/test: {len(y_train)}/{len(y_val)}/{len(y_test)}")
     print("Training models; hyperparameter search is confined to training data.")
-    results = train_all_models(X_train, y_train, X_val, y_val)
+    results = train_all_models(X_train, y_train, X_val, y_val, groups_train=groups_train)
     best_name, best_result = select_best_model(results, metric="pr_auc")
     if not best_name:
         raise RuntimeError("All model trainings failed. See errors above.")
