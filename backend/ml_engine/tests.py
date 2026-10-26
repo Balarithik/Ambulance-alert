@@ -53,6 +53,27 @@ class MLEngineAPITestCase(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
 
 
+    def test_new_patient_with_demographics_passes_request_validation(self):
+        response = self.client.post(
+            "/api/ml/predict/",
+            {
+                "patient_id": "P-PREVIEW-001",
+                "age": 45,
+                "gender": "M",
+                "heart_rate": 118,
+                "temperature": 39.1,
+                "sbp": 100,
+                "dbp": 60,
+                "respiratory_rate": 24,
+            },
+            format="json",
+        )
+        # 503 is acceptable while retrained artifacts/OS runtime are unavailable.
+        # Request validation should not fail with the former demographics-related 400.
+        self.assertNotEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(response.status_code, [status.HTTP_200_OK, status.HTTP_503_SERVICE_UNAVAILABLE])
+
+
 class MLFeatureContractTestCase(TestCase):
     def test_runtime_feature_schema_excludes_unavailable_labs_and_spo2(self):
         from scripts.feature_engineering import get_feature_columns
