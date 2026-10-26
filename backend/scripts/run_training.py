@@ -1,316 +1,195 @@
 #!/usr/bin/env python3
-"""
-AmbuSense AI - Model 1 Training Pipeline
-Patient Deterioration / Sepsis Risk Prediction
-Using PhysioNet 2019 Sepsis Challenge Dataset
-"""
+"""Train the LifeSyncAI ambulance-compatible sepsis-risk prototype.
 
-import os
-import sys
-import gc
+Run from the backend directory:
+    uv run python scripts/run_training.py --data-dir data
+Expected files: data/training_setA/*.psv and data/training_setB/*.psv
+"""
+from __future__ import annotations
+
+import argparse
 import json
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from tqdm import tqdm
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.metrics import precision_recall_curve
 
-sys.path.insert(0, "src")
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+if str(BACKEND_DIR / "scripts") not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR / "scripts"))
 
-from data_loader import (
-    discover_datasets, print_dataset_info, patient_file_generator,
-    load_patient_file, inspect_first_files, get_vital_columns
+from data_loader import discover_datasets, load_patient_file
+from feature_engineering import (
+    FEATURE_SCHEMA_VERSION, engineer_patient_features, get_feature_columns,
 )
-from feature_engineering import engineer_patient_features, get_feature_columns
 from preprocessing import (
     split_patients_by_id, fit_preprocessor, apply_preprocessor,
-    save_preprocessor, save_feature_columns
+    save_preprocessor, save_feature_columns,
 )
-from train import train_all_models, select_best_model, save_model, save_metrics
-from evaluate import (
-    evaluate_model, plot_confusion_matrix, plot_roc_curve,
-    plot_pr_curve, plot_feature_importance, create_comparison_table,
-    save_comparison_table, find_optimal_threshold, define_risk_thresholds
-)
-from predict import SepsisPredictor
+from train import train_all_models, select_best_model, save_model, compute_metrics
 
 
-def process_patient_files(filepaths: list, dataset_source: str, max_patients: int = None) -> list:
-    """Process patient files sequentially with memory efficiency."""
-    processed = []
-    count = 0
+def choose_f1_threshold(y_true, probabilities) -> float:
+    """Choose a threshold on validation data only; never tune on the test set."""
+    precision, recall, thresholds = precision_recall_curve(y_true, probabilities)
+    if len(thresholds) == 0:
+        return 0.5
+    f1 = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-12)
+    return float(thresholds[int(np.nanargmax(f1))])
 
-    for filepath in tqdm(filepaths, desc=f"Processing {dataset_source}"):
-        if max_patients and count >= max_patients:
-            break
 
-        df = load_patient_file(filepath, dataset_source)
+def risk_bands_from_validation(probabilities) -> dict:
+    """Prototype display bands only; these are not clinical decision thresholds."""
+    p25, p50, p75 = [float(x) for x in np.quantile(probabilities, [0.25, 0.50, 0.75])]
+    # Ensure nondecreasing boundaries even when many probabilities are tied.
+    p50 = max(p50, p25)
+    p75 = max(p75, p50)
+    return {
+        "LOW": [0.0, p25],
+        "MODERATE": [p25, p50],
+        "HIGH": [p50, p75],
+        "CRITICAL": [p75, 1.0],
+        "metadata": {
+            "schema_version": FEATURE_SCHEMA_VERSION,
+            "method": "validation-set probability quartiles",
+            "clinical_validation": False,
+            "warning": "Prototype display bands only; not clinically validated triage thresholds.",
+        },
+    }
 
-        if df.empty or "SepsisLabel" not in df.columns:
+
+def process_files(files: list[str], source: str) -> list[pd.DataFrame]:
+    patients = []
+    for index, path in enumerate(files, start=1):
+        frame = load_patient_file(path, source)
+        if frame.empty or "SepsisLabel" not in frame.columns:
             continue
-
-        df_feat = engineer_patient_features(df)
-        if df_feat.empty:
-            continue
-        processed.append(df_feat)
-
-        count += 1
-        if count % 1000 == 0:
-            gc.collect()
-
-    return processed
+        # A file is one patient. IDs are source-prefixed to prevent accidental overlap.
+        frame["patient_id"] = f"{source}-{Path(path).stem}"
+        engineered = engineer_patient_features(frame)
+        if engineered["SepsisLabel"].notna().any():
+            patients.append(engineered)
+        if index % 1000 == 0:
+            print(f"Processed {index}/{len(files)} files from set {source}")
+    return patients
 
 
 def main():
-    print("=" * 60)
-    print("AMBUSENSE AI - MODEL 1 TRAINING PIPELINE")
-    print("Patient Deterioration / Sepsis Risk Prediction")
-    print("=" * 60)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data", help="Directory containing training_setA and training_setB")
+    parser.add_argument("--model-dir", default="models", help="Output directory for model artifacts")
+    parser.add_argument("--output-dir", default="outputs", help="Output directory for metrics")
+    parser.add_argument("--max-patients-per-set", type=int, default=0, help="Optional small smoke-test limit; 0 uses all files")
+    args = parser.parse_args()
 
-    info = discover_datasets("data")
-    print_dataset_info(info)
+    data_dir = Path(args.data_dir).resolve()
+    model_dir = Path(args.model_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    model_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("\n[1/8] Inspecting dataset structure...")
-    inspection = inspect_first_files(info["setA_files"], n=5)
-    print(f"Columns: {inspection['columns']}")
-    print(f"Label distribution (sample): {inspection['label_distribution']}")
+    info = discover_datasets(str(data_dir))
+    files_a, files_b = info["setA_files"], info["setB_files"]
+    if not files_a or not files_b:
+        raise FileNotFoundError(
+            f"Expected .psv files in {data_dir / 'training_setA'} and {data_dir / 'training_setB'}"
+        )
+    if args.max_patients_per_set:
+        files_a = files_a[:args.max_patients_per_set]
+        files_b = files_b[:args.max_patients_per_set]
 
-    vital_cols = get_vital_columns(pd.read_csv(info["setA_files"][0], sep="|"))
-    print(f"Vital sign columns: {vital_cols}")
+    print(f"Loading PhysioNet files: set A={len(files_a)}, set B={len(files_b)}")
+    patients = process_files(files_a, "A") + process_files(files_b, "B")
+    if len(patients) < 3:
+        raise ValueError("At least 3 readable patient files are required.")
 
-    print("\n[2/8] Loading and processing patient data...")
-    print("This may take several minutes...")
+    ids = [str(frame["patient_id"].iloc[0]) for frame in patients]
+    train_ids, val_ids, test_ids = split_patients_by_id(ids)
+    train_set, val_set, test_set = set(train_ids), set(val_ids), set(test_ids)
+    train_dfs = [p for p in patients if str(p["patient_id"].iloc[0]) in train_set]
+    val_dfs = [p for p in patients if str(p["patient_id"].iloc[0]) in val_set]
+    test_dfs = [p for p in patients if str(p["patient_id"].iloc[0]) in test_set]
+    del patients
 
-    all_patients = []
-    for source, files in [("A", info["setA_files"]), ("B", info["setB_files"])]:
-        patients = process_patient_files(files, source)
-        all_patients.extend(patients)
-        print(f"  Loaded {len(patients)} patients from Set {source}")
+    feature_columns = get_feature_columns()
+    print(f"Feature schema={FEATURE_SCHEMA_VERSION}; feature count={len(feature_columns)}")
+    preprocessor = fit_preprocessor(train_dfs, feature_columns)
+    X_train, y_train = apply_preprocessor(train_dfs, feature_columns, preprocessor)
+    X_val, y_val = apply_preprocessor(val_dfs, feature_columns, preprocessor)
+    X_test, y_test = apply_preprocessor(test_dfs, feature_columns, preprocessor)
 
-    print(f"\nTotal patients loaded: {len(all_patients)}")
-
-    total_records = sum(len(p) for p in all_patients)
-    print(f"Total records: {total_records}")
-
-    print("\n[3/8] Analyzing dataset statistics...")
-    all_dfs = pd.concat(all_patients, ignore_index=True)
-    print(f"Columns: {all_dfs.columns.tolist()}")
-    print(f"Missing value percentages:")
-    missing_pct = (all_dfs.isnull().sum() / len(all_dfs) * 100).sort_values(ascending=False)
-    print(missing_pct[missing_pct > 0].head(20))
-
-    label_counts = all_dfs["SepsisLabel"].value_counts().sort_index()
-    print(f"\nSepsisLabel distribution:")
-    print(label_counts)
-    print(f"Class imbalance ratio: {label_counts[0] / label_counts[1]:.2f}:1")
-
-    feature_cols = get_feature_columns(all_dfs)
-    print(f"\nFeature columns ({len(feature_cols)}): {feature_cols}")
-
-    print("\n[4/8] Splitting patients (70/15/15)...")
-    patient_ids = all_dfs["patient_id"].unique().tolist()
-    train_ids, val_ids, test_ids = split_patients_by_id(patient_ids)
-
-    print(f"Train patients: {len(train_ids)}")
-    print(f"Val patients: {len(val_ids)}")
-    print(f"Test patients: {len(test_ids)}")
-
-    train_dfs = [p for p in all_patients if p["patient_id"].iloc[0] in train_ids]
-    val_dfs = [p for p in all_patients if p["patient_id"].iloc[0] in val_ids]
-    test_dfs = [p for p in all_patients if p["patient_id"].iloc[0] in test_ids]
-
-    del all_patients, all_dfs
-    gc.collect()
-
-    print("\n[5/8] Fitting preprocessor on training data...")
-    preprocessor = fit_preprocessor(train_dfs, feature_cols)
-    save_preprocessor(preprocessor, "models/preprocessing_pipeline.pkl")
-    save_feature_columns(feature_cols, "models/feature_columns.json")
-    print("  Preprocessor saved.")
-
-    print("\n[6/8] Preparing training/validation data...")
-    X_train, y_train = apply_preprocessor(train_dfs, feature_cols, preprocessor)
-    X_val, y_val = apply_preprocessor(val_dfs, feature_cols, preprocessor)
-
-    print(f"Train shape: {X_train.shape}, Val shape: {X_val.shape}")
-    print(f"Train labels: {np.bincount(y_train)}")
-    print(f"Val labels: {np.bincount(y_val)}")
-
-    del train_dfs, val_dfs
-    gc.collect()
-
-    print("\n[7/8] Training models...")
-    results = train_all_models(X_train, y_train, X_val, y_val)
-
-    print("\n[8/8] Evaluating and selecting best model...")
-    best_name, best_result = select_best_model(results, metric="f1")
-    print(f"\nBest model: {best_name}")
-    print(f"Validation metrics: {best_result['metrics']}")
-
-    print("\nFinal evaluation on test set...")
-    X_test, y_test = apply_preprocessor(test_dfs, feature_cols, preprocessor)
-    print(f"Test shape: {X_test.shape}")
-    print(f"Test labels: {np.bincount(y_test)}")
-
-    test_metrics = evaluate_model(best_result["model"], X_test, y_test)
-    print(f"Test metrics: {test_metrics}")
-
-    optimal_thresh = find_optimal_threshold(y_test, test_metrics["y_proba"], metric="f1")
-    print(f"Optimal threshold (F1): {optimal_thresh:.4f}")
-
-    test_metrics_optimal = evaluate_model(best_result["model"], X_test, y_test, threshold=optimal_thresh)
-    print(f"Test metrics (optimal threshold): {test_metrics_optimal}")
-
-    risk_thresholds = define_risk_thresholds(y_test, test_metrics["y_proba"])
-    with open("models/risk_thresholds.json", "w") as f:
-        json.dump(risk_thresholds, f, indent=2)
-    print(f"Risk thresholds saved: {risk_thresholds}")
-
-    print("\nGenerating plots...")
-    plot_confusion_matrix(
-        test_metrics_optimal["confusion_matrix"],
-        "outputs/confusion_matrix.png",
-        f"Confusion Matrix - {best_name} (Test Set)"
-    )
-    plot_roc_curve(y_test, test_metrics["y_proba"], "outputs/roc_curve.png", best_name)
-    plot_pr_curve(y_test, test_metrics["y_proba"], "outputs/pr_curve.png", best_name)
-
-    importance = plot_feature_importance(
-        best_result["model"], feature_cols, "outputs/feature_importance.png", top_n=20
-    )
-    print(f"Top features: {list(importance.items())[:10]}")
-
-    comparison_df = create_comparison_table(results)
-    save_comparison_table(comparison_df, "outputs/model_comparison.csv")
-    print(f"\nModel comparison saved to outputs/model_comparison.csv")
-    print(comparison_df.to_string(index=False))
-
-    save_model(best_result["model"], "models/deterioration_model.pkl")
-
-    metadata = {
-        "best_model": best_name,
-        "feature_columns": feature_cols,
-        "n_train_patients": len(train_ids),
-        "n_val_patients": len(val_ids),
-        "n_test_patients": len(test_ids),
-        "n_features": len(feature_cols),
-        "optimal_threshold": float(optimal_thresh),
-        "risk_thresholds": risk_thresholds,
-        "test_metrics": {k: v for k, v in test_metrics_optimal.items() if k not in ["y_proba", "y_pred"]}
-    }
-    with open("models/model_metadata.json", "w") as f:
-        json.dump(metadata, f, indent=2, default=str)
-
-    test_results = test_metrics_optimal.copy()
-    test_results.pop("y_proba", None)
-    test_results.pop("y_pred", None)
-    with open("models/model_metrics.json", "w") as f:
-        json.dump(test_results, f, indent=2, default=str)
-
-    print("\nRunning real-time simulation on unseen test patients...")
-    realtime_results = simulate_realtime(
-        test_dfs[:10], best_result["model"], preprocessor, feature_cols, risk_thresholds
-    )
-
-    realtime_df = pd.DataFrame(realtime_results)
-    realtime_df.to_csv("outputs/realtime_test_results.csv", index=False)
-
-    test_patient_info = []
-    for df in test_dfs[:10]:
-        test_patient_info.append({
-            "patient_id": df["patient_id"].iloc[0],
-            "ICULOS": df["ICULOS"].iloc[-1],
-            "final_sepsis_label": df["SepsisLabel"].iloc[-1]
-        })
-    pd.DataFrame(test_patient_info).to_csv("outputs/unseen_test_patients.csv", index=False)
-
-    print("\nTesting saved model reload...")
-    predictor = SepsisPredictor(
-        model_path="models/deterioration_model.pkl",
-        preprocessor_path="models/preprocessing_pipeline.pkl",
-        feature_columns_path="models/feature_columns.json",
-        risk_thresholds_path="models/risk_thresholds.json"
-    )
-
-    test_result = predictor.predict_patient(
-        heart_rate=108,
-        spo2=92,
-        temperature=38.1,
-        sbp=100,
-        dbp=65,
-        respiratory_rate=24
-    )
-    print(f"Test prediction: {test_result}")
-
-    print("\n" + "=" * 60)
-    print("AMBUSENSE AI - MODEL 1 TRAINING COMPLETE")
-    print("=" * 60)
-    print(f"Dataset A patients: {len(info['setA_files'])}")
-    print(f"Dataset B patients: {len(info['setB_files'])}")
-    print(f"Total patients: {len(patient_ids)}")
-    print(f"Total records: {total_records}")
-    print(f"\nBest model: {best_name}")
-    print(f"Accuracy: {test_metrics_optimal['accuracy']:.4f}")
-    print(f"Precision: {test_metrics_optimal['precision']:.4f}")
-    print(f"Recall: {test_metrics_optimal['recall']:.4f}")
-    print(f"F1: {test_metrics_optimal['f1']:.4f}")
-    print(f"ROC-AUC: {test_metrics_optimal['roc_auc']:.4f}")
-    print(f"PR-AUC: {test_metrics_optimal['pr_auc']:.4f}")
-    print(f"\nRealtime test patients: {len(realtime_df)}")
-    print(f"\nModel saved: models/deterioration_model.pkl")
-    print(f"\nStatus: READY FOR DJANGO INTEGRATION")
-    print("=" * 60)
-
-
-def simulate_realtime(test_dfs, model, preprocessor, feature_cols, risk_thresholds):
-    """Simulate real-time predictions on test patients."""
-    results = []
-
-    for df in test_dfs:
-        patient_id = df["patient_id"].iloc[0]
-        predictor = SepsisPredictor(
-            model_path="models/deterioration_model.pkl",
-            preprocessor_path="models/preprocessing_pipeline.pkl",
-            feature_columns_path="models/feature_columns.json",
-            risk_thresholds_path="models/risk_thresholds.json"
+    if len(np.unique(y_train)) < 2 or len(np.unique(y_val)) < 2:
+        raise ValueError(
+            "Train and validation splits must each contain both SepsisLabel classes. "
+            "Use the full dataset rather than a tiny smoke-test subset."
         )
 
-        for idx, row in df.iterrows():
-            vitals = {col: row[col] for col in ["HR", "O2Sat", "Temp", "SBP", "DBP", "Resp", "MAP"] if col in row and pd.notna(row[col])}
-            if len(vitals) < 3:
-                continue
+    print(f"Rows train/val/test: {len(y_train)}/{len(y_val)}/{len(y_test)}")
+    print("Training models; hyperparameter search is confined to training data.")
+    results = train_all_models(X_train, y_train, X_val, y_val)
+    best_name, best_result = select_best_model(results, metric="pr_auc")
+    if not best_name:
+        raise RuntimeError("All model trainings failed. See errors above.")
 
-            result = predictor.predict_patient(
-                heart_rate=vitals.get("HR", np.nan),
-                spo2=vitals.get("O2Sat", np.nan),
-                temperature=vitals.get("Temp", np.nan),
-                sbp=vitals.get("SBP", np.nan),
-                dbp=vitals.get("DBP", np.nan),
-                respiratory_rate=vitals.get("Resp", np.nan),
-                map_value=vitals.get("MAP", None),
-                icu_los=row.get("ICULOS", None)
-            )
+    best_model = best_result["model"]
+    val_probabilities = best_model.predict_proba(X_val)[:, 1]
+    threshold = choose_f1_threshold(y_val, val_probabilities)
+    test_probabilities = best_model.predict_proba(X_test)[:, 1]
+    test_predictions = (test_probabilities >= threshold).astype(int)
+    test_metrics = compute_metrics(y_test, test_predictions, test_probabilities)
 
-            if "error" not in result:
-                results.append({
-                    "patient_id": patient_id,
-                    "ICULOS": row.get("ICULOS", idx),
-                    "HR": vitals.get("HR", np.nan),
-                    "O2Sat": vitals.get("O2Sat", np.nan),
-                    "SBP": vitals.get("SBP", np.nan),
-                    "DBP": vitals.get("DBP", np.nan),
-                    "Resp": vitals.get("Resp", np.nan),
-                    "Risk_Probability": result["risk_probability"],
-                    "Risk_Level": result["risk_level"],
-                    "Prediction": result["prediction"],
-                    "Actual_SepsisLabel": row.get("SepsisLabel", np.nan)
-                })
+    save_model(best_model, model_dir / "deterioration_model.pkl")
+    save_preprocessor(preprocessor, model_dir / "preprocessing_pipeline.pkl")
+    save_feature_columns(feature_columns, model_dir / "feature_columns.json")
+    bands = risk_bands_from_validation(val_probabilities)
+    (model_dir / "risk_thresholds.json").write_text(json.dumps(bands, indent=2), encoding="utf-8")
 
-    return results
+    comparison = {
+        name: {
+            "metrics": result.get("metrics", {}),
+            "best_params": result.get("best_params", {}),
+            "error": result.get("error"),
+        }
+        for name, result in results.items()
+    }
+    metadata = {
+        "model_schema_version": FEATURE_SCHEMA_VERSION,
+        "target": "SepsisLabel",
+        "dataset": "PhysioNet Computing in Cardiology Challenge 2019",
+        "selected_model": best_name,
+        "selected_by": "validation PR-AUC",
+        "feature_columns": feature_columns,
+        "n_features": len(feature_columns),
+        "patient_counts": {"train": len(train_ids), "validation": len(val_ids), "test": len(test_ids)},
+        "row_counts": {"train": len(y_train), "validation": len(y_val), "test": len(y_test)},
+        "validation_threshold_objective": "maximum F1 on validation split",
+        "classification_threshold": threshold,
+        "test_metrics": test_metrics,
+        "risk_bands": bands["metadata"],
+        "clinical_validation": False,
+        "limitations": [
+            "This predicts the PhysioNet SepsisLabel task, not general all-cause deterioration.",
+            "The dataset is ICU-derived and does not establish performance in moving ambulances.",
+            "Risk bands and classification threshold are research-prototype settings, not clinical triage rules.",
+            "The model must not be used for autonomous treatment or destination decisions.",
+        ],
+    }
+    (model_dir / "model_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    (output_dir / "model_comparison.json").write_text(json.dumps(comparison, indent=2), encoding="utf-8")
+    (output_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2), encoding="utf-8")
+
+    print("\nModel comparison (validation):")
+    for name, result in results.items():
+        metrics = result.get("metrics", {})
+        print(f"  {name}: PR-AUC={metrics.get('pr_auc')} F1={metrics.get('f1')} Recall={metrics.get('recall')}")
+    print(f"Selected model: {best_name}")
+    print(f"Validation-selected threshold: {threshold:.6f}")
+    print(f"Held-out test metrics: {json.dumps(test_metrics, indent=2)}")
+    print(f"Artifacts written to: {model_dir}")
+    print("NOTE: prototype research model; not clinically validated.")
 
 
 if __name__ == "__main__":
-    Path("models").mkdir(exist_ok=True)
-    Path("outputs").mkdir(exist_ok=True)
     main()
