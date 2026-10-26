@@ -196,13 +196,18 @@ export default function AmbulanceDashboard() {
     setLoadingPredict(true);
     setStatusMsg('');
     try {
+      // The patient profile is created only when "Notify Hospital" is pressed.
+      // Include age/gender so an earlier risk assessment works before that request.
       const vitals = {
+        patient_id: patientId.trim(),
+        age: Number(age),
+        gender,
         heart_rate: Number(heartRate),
         temperature: Number(temperature),
         sbp: Number(systolicBp),
         dbp: Number(diastolicBp),
         respiratory_rate: Number(respRate),
-        patient_id: patientId,
+        map_value: (Number(systolicBp) + 2 * Number(diastolicBp)) / 3,
       };
 
       const res = await mlAPI.predict(vitals);
