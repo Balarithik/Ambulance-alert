@@ -52,7 +52,7 @@ class AmbulanceViewSet(viewsets.ModelViewSet):
             reading_kwargs = {
                 'reading_id': data.get('reading_id', 0),
                 'heart_rate': data.get('heart_rate'),
-                'temperature': 0 ,
+                'temperature': data.get('temperature'),
                 'device_id': data.get('device', 'LifeSyncAI-Ambulance-ESP32'),
                 'new_reading': data.get('new_reading', True),
             }

@@ -1,111 +1,164 @@
-import pandas as pd
+"""Shared feature contract for training and ambulance-time inference.
+
+The model uses only the core variables that can be entered/collected by LifeSyncAI.
+PhysioNet's additional laboratory/O2Sat columns are intentionally excluded because the
+current ambulance hardware does not provide them.
+"""
+from __future__ import annotations
+
+from typing import Iterable
+
 import numpy as np
-from typing import List, Dict, Optional
-import warnings
-warnings.filterwarnings("ignore")
+import pandas as pd
 
-
-VITAL_COLUMNS = ["HR", "O2Sat", "Temp", "SBP", "MAP", "DBP", "Resp"]
+FEATURE_SCHEMA_VERSION = "ambulance-v2"
 ROLLING_WINDOW = 6
+BASE_VITAL_COLUMNS = ["HR", "Temp", "SBP", "DBP", "Resp", "MAP"]
+TEMPORAL_SUFFIXES = ["prev", "change", "rolling_mean", "rolling_std", "trend"]
+STATIC_FEATURE_COLUMNS = ["age", "gender"]
+MODEL_FEATURE_COLUMNS = (
+    STATIC_FEATURE_COLUMNS
+    + BASE_VITAL_COLUMNS
+    + [f"{vital}_{suffix}" for vital in BASE_VITAL_COLUMNS for suffix in TEMPORAL_SUFFIXES]
+)
 
 
-def create_temporal_features(df: pd.DataFrame, vital_cols: List[str], window: int = ROLLING_WINDOW) -> pd.DataFrame:
-    """
-    Create temporal features for vital signs using only past information.
-    Features: current, previous, change, rolling mean/min/max/std, trend.
-    """
-    df = df.copy()
-    df = df.sort_values("ICULOS").reset_index(drop=True)
+def normalize_gender(value):
+    """Map PhysioNet's 0=female / 1=male encoding and common UI strings consistently."""
+    if value is None or pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        number = float(value)
+        return number if number in (0.0, 1.0) else np.nan
 
-    for col in vital_cols:
-        if col not in df.columns:
-            continue
+    label = str(value).strip().lower()
+    if label in {"0", "0.0", "f", "female", "woman"}:
+        return 0.0
+    if label in {"1", "1.0", "m", "male", "man"}:
+        return 1.0
+    return np.nan
 
-        values = df[col].values
 
-        df[f"{col}_prev"] = df[col].shift(1)
-        df[f"{col}_change"] = df[col] - df[f"{col}_prev"]
+def _trend_slope(values: np.ndarray) -> float:
+    """Least-squares slope for a short, time-ordered window; ignore missing points."""
+    values = np.asarray(values, dtype=float)
+    valid = np.isfinite(values)
+    if valid.sum() < 2:
+        return 0.0 if valid.sum() == 1 else np.nan
+    x = np.arange(len(values), dtype=float)[valid]
+    y = values[valid]
+    return float(np.polyfit(x, y, 1)[0])
 
-        df[f"{col}_rolling_mean"] = df[col].rolling(window=window, min_periods=1).mean()
-        df[f"{col}_rolling_min"] = df[col].rolling(window=window, min_periods=1).min()
-        df[f"{col}_rolling_max"] = df[col].rolling(window=window, min_periods=1).max()
-        df[f"{col}_rolling_std"] = df[col].rolling(window=window, min_periods=1).std()
 
-        df[f"{col}_trend"] = df[col].rolling(window=window, min_periods=2).apply(
-            lambda x: np.polyfit(np.arange(len(x)), x, 1)[0] if len(x) >= 2 else 0,
-            raw=True
-        )
-
+def _to_numeric_columns(df: pd.DataFrame, columns: Iterable[str]) -> pd.DataFrame:
+    for column in columns:
+        if column not in df.columns:
+            df[column] = np.nan
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+        df[column] = df[column].replace([np.inf, -np.inf], np.nan)
     return df
+
+
+def engineer_patient_features(df: pd.DataFrame, window: int = ROLLING_WINDOW) -> pd.DataFrame:
+    """Create online-safe features from one patient's time-ordered vital history.
+
+    This function is shared by offline training and runtime prediction. It only uses
+    the current and previous rows; no future measurements are referenced.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["ICULOS", *MODEL_FEATURE_COLUMNS, "SepsisLabel"])
+
+    if window < 2:
+        raise ValueError("window must be at least 2")
+
+    frame = df.copy()
+    if "ICULOS" not in frame.columns:
+        frame["ICULOS"] = np.arange(1, len(frame) + 1)
+    frame = frame.sort_values("ICULOS", kind="stable").reset_index(drop=True)
+
+    # Accept the canonical dataset names as well as values already prepared by an API.
+    if "Age" not in frame.columns and "age" in frame.columns:
+        frame["Age"] = frame["age"]
+    if "Gender" not in frame.columns and "gender" in frame.columns:
+        frame["Gender"] = frame["gender"]
+
+    if "Age" in frame.columns:
+        frame["age"] = pd.to_numeric(frame["Age"], errors="coerce")
+    else:
+        frame["age"] = np.nan
+
+    if "Gender" in frame.columns:
+        frame["gender"] = frame["Gender"].map(normalize_gender)
+    else:
+        frame["gender"] = np.nan
+
+    # Normalize core vitals. MAP is derived from BP when both pressures are present.
+    _to_numeric_columns(frame, ["HR", "Temp", "SBP", "DBP", "Resp"])
+    source_map = pd.to_numeric(frame["MAP"], errors="coerce") if "MAP" in frame.columns else pd.Series(np.nan, index=frame.index)
+    source_map = source_map.replace([np.inf, -np.inf], np.nan)
+    derived_map = (frame["SBP"] + 2.0 * frame["DBP"]) / 3.0
+    frame["MAP"] = derived_map.where(derived_map.notna(), source_map)
+
+    for vital in BASE_VITAL_COLUMNS:
+        current = frame[vital]
+        rolling = current.rolling(window=window, min_periods=1)
+        frame[f"{vital}_prev"] = current.shift(1)
+        frame[f"{vital}_change"] = current - frame[f"{vital}_prev"]
+        frame[f"{vital}_rolling_mean"] = rolling.mean()
+        frame[f"{vital}_rolling_std"] = rolling.std(ddof=0)
+        frame[f"{vital}_trend"] = current.rolling(
+            window=window, min_periods=1
+        ).apply(_trend_slope, raw=True)
+
+    # Keep one deterministic feature schema in both training and inference.
+    for column in MODEL_FEATURE_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = np.nan
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        frame[column] = frame[column].replace([np.inf, -np.inf], np.nan)
+
+    return frame
+
+
+def get_feature_columns(_df: pd.DataFrame | None = None) -> list[str]:
+    """Return the fixed, deployment-compatible feature order."""
+    return list(MODEL_FEATURE_COLUMNS)
+
+
+def create_temporal_features(
+    df: pd.DataFrame, vital_cols: list[str] | None = None, window: int = ROLLING_WINDOW
+) -> pd.DataFrame:
+    """Compatibility wrapper for older training scripts."""
+    return engineer_patient_features(df, window=window)
 
 
 def add_static_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add static patient features."""
-    df = df.copy()
-
-    if "Age" in df.columns:
-        df["age"] = df["Age"].iloc[0] if df["Age"].notna().any() else np.nan
-
-    if "Gender" in df.columns:
-        df["gender"] = df["Gender"].iloc[0] if df["Gender"].notna().any() else np.nan
-
-    if "HospAdmTime" in df.columns:
-        df["hosp_adm_time"] = df["HospAdmTime"].iloc[0] if df["HospAdmTime"].notna().any() else np.nan
-
-    return df
+    """Compatibility wrapper; full engineering produces the normalized static fields."""
+    result = df.copy()
+    if "Age" in result.columns:
+        result["age"] = pd.to_numeric(result["Age"], errors="coerce")
+    if "Gender" in result.columns:
+        result["gender"] = result["Gender"].map(normalize_gender)
+    return result
 
 
-def add_aggregate_features(df: pd.DataFrame, vital_cols: List[str]) -> pd.DataFrame:
-    """Add aggregate statistics per patient (up to current time)."""
-    df = df.copy()
+def add_aggregate_features(df: pd.DataFrame, vital_cols: list[str] | None = None) -> pd.DataFrame:
+    """Deprecated compatibility wrapper.
 
-    for col in vital_cols:
-        if col not in df.columns:
-            continue
-
-        expanding = df[col].expanding(min_periods=1)
-        df[f"{col}_expanding_mean"] = expanding.mean()
-        df[f"{col}_expanding_min"] = expanding.min()
-        df[f"{col}_expanding_max"] = expanding.max()
-        df[f"{col}_expanding_std"] = expanding.std()
-
-    return df
-
-
-def engineer_patient_features(df: pd.DataFrame) -> pd.DataFrame:
+    Expanding statistics were removed because training them over full patient histories
+    did not match the truncated, live ambulance history.
     """
-    Complete feature engineering pipeline for a single patient.
-    Preserves temporal order and prevents leakage.
-    """
-    vital_cols = [c for c in VITAL_COLUMNS if c in df.columns]
-
-    df = create_temporal_features(df, vital_cols)
-    df = add_static_features(df)
-    df = add_aggregate_features(df, vital_cols)
-
-    return df
-
-
-def get_feature_columns(df: pd.DataFrame, exclude_cols: Optional[List[str]] = None) -> List[str]:
-    """Get list of feature columns excluding targets and identifiers."""
-    if exclude_cols is None:
-        exclude_cols = [
-            "patient_id", "dataset_source", "ICULOS", "SepsisLabel",
-            "Age", "Gender", "Unit1", "Unit2", "HospAdmTime"
-        ]
-
-    feature_cols = [c for c in df.columns if c not in exclude_cols]
-    return feature_cols
+    return df.copy()
 
 
 if __name__ == "__main__":
-    from data_loader import load_patient_file
-    df = load_patient_file("data/training_setA/p000001.psv", "A")
-    print("Original columns:", df.columns.tolist())
-    print("Shape:", df.shape)
-
-    df_feat = engineer_patient_features(df)
-    print("\nFeature columns:", get_feature_columns(df_feat))
-    print("Shape after feature engineering:", df_feat.shape)
-    print("\nSample features:")
-    print(df_feat[["HR", "HR_prev", "HR_change", "HR_rolling_mean", "HR_trend", "SepsisLabel"]].head(10))
+    sample = pd.DataFrame(
+        [
+            {"ICULOS": 1, "Age": 50, "Gender": 1, "HR": 85, "Temp": 37.0, "SBP": 120, "DBP": 80, "Resp": 16},
+            {"ICULOS": 2, "Age": 50, "Gender": 1, "HR": 96, "Temp": 37.4, "SBP": 118, "DBP": 78, "Resp": 18},
+        ]
+    )
+    engineered = engineer_patient_features(sample)
+    print("Schema version:", FEATURE_SCHEMA_VERSION)
+    print("Feature count:", len(get_feature_columns(engineered)))
+    print(engineered[get_feature_columns(engineered)].tail(1).to_string(index=False))

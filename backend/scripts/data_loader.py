@@ -4,7 +4,6 @@ import numpy as np
 from pathlib import Path
 from typing import Generator, Tuple, List, Optional
 import gc
-from tqdm import tqdm
 
 
 def discover_datasets(base_path: str = "data") -> dict:
